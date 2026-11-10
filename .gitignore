@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local training outputs and checkpoints
+models/*
+!models/.gitkeep
+
+# Local runtime and ETL logs
+logs/*
+!logs/.gitkeep

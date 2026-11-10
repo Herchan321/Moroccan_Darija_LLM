@@ -1,0 +1,10 @@
+{
+  "gold_records": 50743,
+  "candidate_examples": 198968,
+  "deduplicated_examples": 198158,
+  "train_examples": 20000,
+  "validation_examples": 2000,
+  "train_file": "C:\\Users\\dell\\Downloads\\finetunning\\Moroccan_Darija_LLM\\data\\gold\\sft\\train.jsonl",
+  "validation_file": "C:\\Users\\dell\\Downloads\\finetunning\\Moroccan_Darija_LLM\\data\\gold\\sft\\validation.jsonl",
+  "seed": 42
+}

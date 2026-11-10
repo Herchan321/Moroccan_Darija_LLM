@@ -1,37 +1,46 @@
 # -*- coding: utf-8 -*-
 import argparse
-import os
-from pathlib import Path
 import torch
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    BitsAndBytesConfig,
-    TrainingArguments,
-    Trainer,
-    DataCollatorForLanguageModeling
-)
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training
-)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tuning Qwen-2.5 sur la Darija marocaine.")
     parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--train_file", type=str, required=True)
-    parser.add_argument("--val_file", type=str, required=True)
+    parser.add_argument("--train_file", type=str, default="data/gold/sft/train.jsonl")
+    parser.add_argument("--val_file", type=str, default="data/gold/sft/validation.jsonl")
     parser.add_argument("--output_dir", type=str, default="./models/qwen-darija-checkpoints")
     parser.add_argument("--adapter_dir", type=str, default="./models/qwen-darija-lora")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--resume_from_checkpoint", action="store_true")
+    parser.add_argument("--allow_cpu", action="store_true")
+    parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument("--max_eval_samples", type=int, default=None)
+    parser.add_argument("--max_length", type=int, default=256)
     return parser.parse_args()
 
 def main():
     args = parse_args()
+    cuda = getattr(torch, "cuda", None)
+    use_cuda = cuda is not None and cuda.is_available()
+    if not use_cuda:
+        print("Aucun GPU CUDA détecté: entraînement CPU activé.")
+
+    from datasets import load_dataset
+    from transformers import (
+        AutoTokenizer,
+        AutoModelForCausalLM,
+        BitsAndBytesConfig,
+        TrainingArguments,
+        Trainer,
+        DataCollatorForLanguageModeling,
+    )
+    from peft import (
+        LoraConfig,
+        get_peft_model,
+        prepare_model_for_kbit_training,
+    )
+
     print(f"Chargement du tokenizer pour {args.model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -43,12 +52,19 @@ def main():
 
     def tokenize_function(batch):
         texts = [tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=False) for msg in batch["messages"]]
-        return tokenizer(texts, truncation=True, max_length=256)
+        return tokenizer(texts, truncation=True, max_length=args.max_length)
 
     tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=dataset["train"].column_names)
+    if args.max_train_samples is not None:
+        tokenized_dataset["train"] = tokenized_dataset["train"].select(
+            range(min(args.max_train_samples, len(tokenized_dataset["train"])))
+        )
+    if args.max_eval_samples is not None:
+        tokenized_dataset["validation"] = tokenized_dataset["validation"].select(
+            range(min(args.max_eval_samples, len(tokenized_dataset["validation"])))
+        )
 
     print("Configuration du modèle quantifié (QLoRA)...")
-    use_cuda = torch.cuda.is_available()
     bnb_config = None
     device_map = None
     
@@ -62,7 +78,7 @@ def main():
         device_map = "auto"
         torch_dtype = torch.float16
     else:
-        print("⚠️ Aucun GPU détecté, exécution sur CPU sans quantification (mode test/développement).")
+        print("Aucun GPU détecté: exécution CPU explicitement autorisée.")
         torch_dtype = torch.float32
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -91,8 +107,8 @@ def main():
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
+        per_device_train_batch_size=1 if not use_cuda else args.batch_size,
+        per_device_eval_batch_size=1 if not use_cuda else args.batch_size,
         gradient_accumulation_steps=4 if use_cuda else 1,
         learning_rate=args.lr,
         weight_decay=0.01,
@@ -102,12 +118,12 @@ def main():
         use_cpu=not use_cuda,
         gradient_checkpointing=use_cuda,
         optim="paged_adamw_8bit" if use_cuda else "adamw_torch",
-        evaluation_strategy="steps",
-        eval_steps=250,
+        eval_strategy="steps",
+        eval_steps=50 if not use_cuda else 250,
         save_strategy="steps",
-        save_steps=250,
+        save_steps=50 if not use_cuda else 250,
         save_total_limit=2,
-        logging_steps=50,
+        logging_steps=1 if not use_cuda else 50,
         report_to="none"
     )
 
@@ -119,8 +135,11 @@ def main():
         data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     )
 
-    print("Lancement de l'entraînement...")
-    trainer.train()
+    print(
+        f"Lancement de l'entraînement sur {'GPU' if use_cuda else 'CPU'} "
+        f"({len(tokenized_dataset['train'])} exemples)..."
+    )
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
 
     print(f"Sauvegarde des adaptateurs LoRA finaux dans : {args.adapter_dir}")
     model.save_pretrained(args.adapter_dir)
